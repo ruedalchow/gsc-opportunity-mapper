@@ -5,23 +5,40 @@ import re
 from collections import Counter
 from urllib.parse import urlparse
 from datetime import datetime, timezone
+from typing import List, Dict, Tuple, Optional, Any, Union
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.cluster import AgglomerativeClustering
+from sklearn.cluster import AgglomerativeClustering, MiniBatchKMeans
 
-st.set_page_config(page_title="GSC Opportunity Mapper (Exec-friendly)", layout="wide")
+# ----------------------------
+# Configuration & Constants
+# ----------------------------
+st.set_page_config(page_title="GSC Opportunity Mapper (Stratified)", layout="wide")
 
+CTR_FLOOR = {
+    "1-3": 0.15,
+    "4-6": 0.08,
+    "7-10": 0.04,
+    "11-20": 0.015,
+    "21+": 0.005,
+    "unknown": 0.01
+}
+
+PRIORITY_QUANTILES = (0.70, 0.90)
+CLUSTERING_THRESHOLD_N = 10000  # Switch to MiniBatchKMeans if queries > this
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def parse_ctr(x):
+def parse_ctr(x: Any) -> float:
     if pd.isna(x):
         return np.nan
     if isinstance(x, (int, float)):
@@ -30,46 +47,51 @@ def parse_ctr(x):
     if s.endswith("%"):
         try:
             return float(s[:-1].strip()) / 100.0
-        except:
+        except ValueError:
             return np.nan
     try:
         return float(s)
-    except:
+    except ValueError:
         return np.nan
 
+def normalize_query_vectorized(series: pd.Series) -> pd.Series:
+    return (
+        series.astype(str)
+        .str.lower()
+        .str.strip()
+        .str.replace(r"[’']", "", regex=True)
+        .str.replace(r"[^a-z0-9\s\-]", " ", regex=True)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
 
-def normalize_query(q: str) -> str:
-    q = str(q).lower().strip()
-    q = re.sub(r"[’']", "", q)
-    q = re.sub(r"[^a-z0-9\s\-]", " ", q)
-    q = re.sub(r"\s+", " ", q).strip()
-    return q
-
-
-def url_to_tokens(url: str):
+def url_to_tokens(url: str) -> List[str]:
     try:
         p = urlparse(str(url))
         path = p.path.strip("/")
-    except:
+    except Exception:
         path = str(url)
-    if path == "":
+    if not path:
         return ["home"]
     toks = re.split(r"[\/\-\_]+", path)
-    toks = [re.sub(r"[^a-z0-9]", "", t.lower()) for t in toks if t]
-    toks = [t for t in toks if t and t not in {"amp", "utm", "http", "https", "www", "com"}]
-    return toks
-
+    clean_toks = []
+    for t in toks:
+        if not t:
+            continue
+        t_clean = re.sub(r"[^a-z0-9]", "", t.lower())
+        if t_clean and t_clean not in {"amp", "utm", "http", "https", "www", "com"}:
+            clean_toks.append(t_clean)
+    return clean_toks
 
 def slug_from_url(u: str) -> str:
     try:
         p = urlparse(str(u))
         s = p.path.strip("/")
         return s if s else "home"
-    except:
+    except Exception:
         return str(u)[:60]
 
-
-def pos_bucket(p):
+def pos_bucket(p: float) -> str:
     if pd.isna(p):
         return "unknown"
     if p <= 3:
@@ -82,522 +104,187 @@ def pos_bucket(p):
         return "11-20"
     return "21+"
 
-
-CTR_FLOOR = {"1-3": 0.15, "4-6": 0.08, "7-10": 0.04, "11-20": 0.015, "21+": 0.005, "unknown": 0.01}
-
-
-def expected_ctr_with_floor(p, bucket_median, overall_median):
+def expected_ctr_with_floor(p: float, bucket_median: Dict[str, float], overall_median: float) -> float:
     b = pos_bucket(p)
     med = bucket_median.get(b, overall_median)
     if pd.isna(med):
         med = overall_median if not pd.isna(overall_median) else 0.01
     return max(med, CTR_FLOOR.get(b, 0.01))
 
+def safe_int(x):
+    try:
+        if pd.isna(x): return 0
+        return int(round(float(x)))
+    except: return 0
+
+def safe_float(x):
+    try:
+        if pd.isna(x): return None
+        return float(x)
+    except: return None
+
+def md_table(headers, rows, max_col_width=80):
+    def trunc(s):
+        s = str(s)
+        return s if len(s) <= max_col_width else (s[: max_col_width - 1] + "…")
+    hdr = "| " + " | ".join([trunc(h) for h in headers]) + " |"
+    sep = "| " + " | ".join(["---"] * len(headers)) + " |"
+    body = "\n".join(["| " + " | ".join([trunc(c) for c in r]) + " |" for r in rows])
+    return "\n".join([hdr, sep, body])
 
 # ----------------------------
-# Intent rules (client-agnostic, brand input)
+# Intent & Brand Logic
 # ----------------------------
-def build_intent_rules(brand_terms, custom_rules=None):
-    """
-    brand_terms: list of strings like ["acme", "acme ltd"]
-    custom_rules: optional dict {intent: [regex,...]} to REPLACE defaults for that intent
-    """
+def build_intent_rules(brand_terms: List[str], custom_rules: Optional[Dict[str, List[str]]] = None) -> Dict[str, List[str]]:
     bt = [re.escape(t.strip().lower()) for t in brand_terms if t and t.strip()]
-    brand_regexes = []
-    for term in bt:
-        brand_regexes.append(rf"\b{term}\b")
+    brand_regexes = [rf"\b{term}\b" for term in bt]
 
     default_rules = {
         "navigational": brand_regexes + [
-            r"\blogin\b",
-            r"\bsign[\s\-]?in\b",
-            r"\bsign[\s\-]?up\b",
-            r"\bcontact\b",
-            r"\bcustomer service\b",
-            r"\bphone number\b",
+            r"\blogin\b", r"\bsign[\s\-]?in\b", r"\bsign[\s\-]?up\b",
+            r"\bcontact\b", r"\bcustomer service\b", r"\bphone number\b",
         ],
         "transactional": [
-            r"\bbuy\b",
-            r"\border\b",
-            r"\bpricing\b",
-            r"\bprice\b",
-            r"\bcost\b",
-            r"\bquote\b",
-            r"\bbook(ing)?\b",
-            r"\bappointment\b",
-            r"\brequest\b",
-            r"\bdemo\b",
-            r"\bhire\b",
-            r"\bagency\b",
-            r"\bservice(s)?\b",
-            r"\bconsultant\b",
-            r"\bcompany\b",
-            r"\bnear me\b",
+            r"\bbuy\b", r"\border\b", r"\bpricing\b", r"\bprice\b", r"\bcost\b",
+            r"\bquote\b", r"\bbook(ing)?\b", r"\bappointment\b", r"\brequest\b",
+            r"\bdemo\b", r"\bhire\b", r"\bagency\b", r"\bservice(s)?\b",
+            r"\bconsultant\b", r"\bcompany\b", r"\bnear me\b",
             r"\b(in|near)\s+[a-z]{3,}\b",
         ],
         "commercial": [
-            r"\bbest\b",
-            r"\btop\b",
-            r"\breview(s)?\b",
-            r"\bvs\b",
-            r"\bcompare\b",
-            r"\bcomparison\b",
-            r"\balternative(s)?\b",
+            r"\bbest\b", r"\btop\b", r"\breview(s)?\b", r"\bvs\b",
+            r"\bcompare\b", r"\bcomparison\b", r"\balternative(s)?\b",
             r"\brating(s)?\b",
         ],
         "informational": [
-            r"\bhow\b",
-            r"\bwhat\b",
-            r"\bwhy\b",
-            r"\bguide\b",
-            r"\btutorial\b",
-            r"\bdefinition\b",
-            r"\bmeaning\b",
-            r"\bexample(s)?\b",
-            r"\btips\b",
+            r"\bhow\b", r"\bwhat\b", r"\bwhy\b", r"\bguide\b",
+            r"\btutorial\b", r"\bdefinition\b", r"\bmeaning\b",
+            r"\bexample(s)?\b", r"\btips\b",
         ],
     }
-
     if custom_rules:
         for k, v in custom_rules.items():
             if k in default_rules and isinstance(v, list) and v:
-                default_rules[k] = v  # replace entirely
-
+                default_rules[k] = v
     return default_rules
 
-
-def compile_rules(intent_rules):
+def compile_rules(intent_rules: Dict[str, List[str]]) -> Dict[str, List[re.Pattern]]:
     compiled = {}
     for intent, patterns in intent_rules.items():
         compiled[intent] = [re.compile(p, flags=re.IGNORECASE) for p in patterns if p and p.strip()]
     return compiled
 
-
-def classify_intent(q_norm, compiled_rules):
+def classify_intent_row(q_norm: str, compiled_rules: Dict[str, List[re.Pattern]]) -> Tuple[str, float, List[str]]:
     matched = []
     for intent, regs in compiled_rules.items():
         for rgx in regs:
             if rgx.search(q_norm):
                 matched.append(intent)
                 break
-
-    if "navigational" in matched:
-        intent = "navigational"
-    elif "transactional" in matched:
-        intent = "transactional"
-    elif "commercial" in matched:
-        intent = "commercial"
-    elif "informational" in matched:
-        intent = "informational"
-    else:
-        intent = "informational"
+    
+    if "navigational" in matched: intent = "navigational"
+    elif "transactional" in matched: intent = "transactional"
+    elif "commercial" in matched: intent = "commercial"
+    elif "informational" in matched: intent = "informational"
+    else: intent = "informational"
 
     conf = min(0.55 + 0.15 * len(matched), 0.95)
     return intent, conf, matched
 
+def check_branded(q_norm: str, brand_regexes: List[re.Pattern]) -> bool:
+    for rgx in brand_regexes:
+        if rgx.search(q_norm):
+            return True
+    return False
 
 # ----------------------------
-# Charts (bigger + labels)
+# Pipeline Steps
 # ----------------------------
-def chart_leaderboard_stacked(df_pages, topn=20, title_suffix="", label_col="slug"):
-    d = df_pages.sort_values("opportunity_clicks", ascending=False).head(topn).copy()
-    labels = d[label_col].astype(str)
 
-    actual = d["actual_clicks"].fillna(0).values
-    opp = d["opportunity_clicks"].fillna(0).values
+def preprocess_queries(df: pd.DataFrame, compiled_rules: Dict[str, List[re.Pattern]], brand_regexes: List[re.Pattern]) -> pd.DataFrame:
+    required_cols = ["Top queries", "Clicks", "Impressions", "CTR", "Position"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in Queries CSV: {missing}")
 
-    fig = plt.figure(figsize=(14, 9))
-    y = np.arange(len(d))
-
-    plt.barh(y, actual, label="Actual clicks")
-    plt.barh(y, opp, left=actual, label="Opportunity clicks (est.)")
-
-    plt.yticks(y, labels)
-    plt.gca().invert_yaxis()
-    plt.xlabel("Clicks (actual + opportunity)")
-    plt.title(f"Top {topn} pages: actual vs opportunity{title_suffix}")
-    plt.legend(loc="lower right")
-    plt.tight_layout()
-    return fig
-
-
-def chart_scatter_labeled(df_pages, topn=50, label_top=10, title_suffix="", label_col="slug"):
-    d = df_pages.sort_values("opportunity_clicks", ascending=False).head(topn).copy()
-
-    fig = plt.figure(figsize=(14, 8))
-    plt.scatter(d["avg_position"], d["opportunity_clicks"])
-
-    plt.xlabel("Avg position (lower is better)")
-    plt.ylabel("Opportunity clicks (estimated)")
-    plt.title(f"Impact vs Effort (top {topn}; labels = top {label_top}){title_suffix}")
-
-    if label_top and label_top > 0:
-        d_lab = d.head(label_top)
-        for _, r in d_lab.iterrows():
-            plt.annotate(str(r[label_col]), (r["avg_position"], r["opportunity_clicks"]))
-
-    plt.tight_layout()
-    return fig
-
-
-def chart_ctr_vs_position_labeled(df_pages, topn=200, label_top=12, title_suffix="", label_col="slug"):
-    d = df_pages.sort_values("impressions", ascending=False).head(topn).copy()
-
-    fig = plt.figure(figsize=(14, 8))
-    plt.scatter(d["avg_position"], d["ctr"])
-
-    plt.xlabel("Avg position")
-    plt.ylabel("CTR")
-    plt.title(f"CTR vs Position (top {topn} by impressions; labels = top {label_top}){title_suffix}")
-
-    if label_top and label_top > 0:
-        d_lab = d.sort_values("opportunity_clicks", ascending=False).head(label_top)
-        for _, r in d_lab.iterrows():
-            plt.annotate(str(r[label_col]), (r["avg_position"], r["ctr"]))
-
-    plt.tight_layout()
-    return fig
-
-
-# ----------------------------
-# GPT brief generators (JSON + Markdown)
-# ----------------------------
-def safe_float(x):
-    try:
-        if pd.isna(x):
-            return None
-        return float(x)
-    except:
-        return None
-
-
-def safe_int(x):
-    try:
-        if pd.isna(x):
-            return 0
-        return int(round(float(x)))
-    except:
-        return 0
-
-
-def md_table(headers, rows, max_col_width=80):
-    # Simple markdown table generator (no external libs)
-    def trunc(s):
-        s = str(s)
-        return s if len(s) <= max_col_width else (s[: max_col_width - 1] + "…")
-
-    hdr = "| " + " | ".join([trunc(h) for h in headers]) + " |"
-    sep = "| " + " | ".join(["---"] * len(headers)) + " |"
-    body = "\n".join(["| " + " | ".join([trunc(c) for c in r]) + " |" for r in rows])
-    return "\n".join([hdr, sep, body])
-
-
-def build_gpt_brief(
-    q_out: pd.DataFrame,
-    cluster_out: pd.DataFrame,
-    page_opps_all: pd.DataFrame,
-    page_opps_intent: pd.DataFrame,
-    brand_terms: list,
-    client_name: str = "",
-    min_impressions: int = 100,
-    top_pages: int = 20,
-    top_clusters: int = 20,
-    queries_per_cluster: int = 5,
-):
-    # Filter pages for headline KPIs & top lists
-    pages_f = page_opps_all.copy()
-    pages_f = pages_f[pages_f["impressions"].fillna(0) >= float(min_impressions)].copy()
-    pages_f["slug"] = pages_f["slug"].fillna(pages_f["page"].apply(slug_from_url))
-    pages_f["ctr"] = pages_f["ctr"].fillna(pages_f.get("page_ctr"))
-    pages_f["avg_position"] = pages_f["avg_position"].fillna(pages_f.get("page_position"))
-
-    total_clicks = pages_f["actual_clicks"].fillna(0).sum()
-    total_opp = pages_f["opportunity_clicks"].fillna(0).sum()
-    uplift_pct = (total_opp / total_clicks * 100.0) if total_clicks > 0 else 0.0
-
-    # Top pages
-    top_pages_df = pages_f.sort_values("opportunity_clicks", ascending=False).head(top_pages).copy()
-    top_pages_list = []
-    for _, r in top_pages_df.iterrows():
-        top_pages_list.append(
-            {
-                "url": str(r.get("page")),
-                "slug": str(r.get("slug")),
-                "mapped_impressions": safe_int(r.get("impressions")),
-                "mapped_clicks": safe_int(r.get("actual_clicks")),
-                "opportunity_clicks_est": safe_int(r.get("opportunity_clicks")),
-                "avg_position": safe_float(r.get("avg_position")),
-                "ctr": safe_float(r.get("ctr")),
-                "page_export_clicks": safe_int(r.get("page_clicks")),
-                "page_export_impressions": safe_int(r.get("page_impressions")),
-                "page_export_ctr": safe_float(r.get("page_ctr")),
-                "page_export_position": safe_float(r.get("page_position")),
-            }
-        )
-
-    # Top clusters (use opportunity_clicks first; then priority_score if present)
-    cl = cluster_out.copy()
-    sort_cols = ["opportunity_clicks"]
-    if "priority_score" in cl.columns:
-        sort_cols = ["opportunity_clicks", "priority_score"]
-    cl_top = cl.sort_values(sort_cols, ascending=False).head(top_clusters).copy()
-
-    # Sample queries per cluster (top impressions)
-    q_samp = (
-        q_out.sort_values(["cluster_id", "impressions"], ascending=[True, False])
-        .groupby("cluster_id")
-        .head(queries_per_cluster)
-        .copy()
-    )
-    samples = {}
-    for cid, sub in q_samp.groupby("cluster_id"):
-        samples[str(cid)] = [
-            {
-                "query": str(r["query"]),
-                "intent": str(r.get("intent")),
-                "impressions": safe_int(r.get("impressions")),
-                "clicks": safe_int(r.get("clicks")),
-                "position": safe_float(r.get("position")),
-                "ctr": safe_float(r.get("ctr")),
-                "opportunity_clicks_est": safe_int(r.get("opportunity_clicks")),
-                "primary_page": str(r.get("primary_page")) if "primary_page" in sub.columns else None,
-            }
-            for _, r in sub.iterrows()
-        ]
-
-    top_clusters_list = []
-    for _, r in cl_top.iterrows():
-        cid = str(r.get("cluster_id"))
-        top_clusters_list.append(
-            {
-                "cluster_id": cid,
-                "topic_label": str(r.get("topic_label")),
-                "dominant_intent": str(r.get("dominant_intent")),
-                "mapped_page": str(r.get("primary_page")),
-                "match_score": safe_float(r.get("match_score")),
-                "queries": safe_int(r.get("queries")),
-                "clicks": safe_int(r.get("clicks")),
-                "impressions": safe_int(r.get("impressions")),
-                "avg_position": safe_float(r.get("avg_position")),
-                "opportunity_clicks_est": safe_int(r.get("opportunity_clicks")),
-                "priority_band": str(r.get("priority_band")),
-                "recommended_action": str(r.get("recommended_action")),
-                "sample_queries": samples.get(cid, []),
-            }
-        )
-
-    # Cannibalisation list
-    cann = cluster_out[cluster_out.get("cannibalisation_risk", False) == True].copy()
-    cann = cann.sort_values(["opportunity_clicks"], ascending=False).head(50)
-    cann_list = []
-    for _, r in cann.iterrows():
-        cann_list.append(
-            {
-                "cluster_id": str(r.get("cluster_id")),
-                "topic_label": str(r.get("topic_label")),
-                "dominant_intent": str(r.get("dominant_intent")),
-                "primary_page": str(r.get("primary_page")),
-                "runner_up_page": str(r.get("runner_up_page")),
-                "match_score": safe_float(r.get("match_score")),
-                "runner_up_score": safe_float(r.get("runner_up_score")),
-                "recommended_action": str(r.get("recommended_action")),
-            }
-        )
-
-    # Intent breakdown totals + top pages per intent (mapped)
-    intent_breakdown = {}
-    for intent in ["informational", "commercial", "transactional", "navigational"]:
-        di = page_opps_intent[page_opps_intent["intent"] == intent].copy()
-        if len(di) == 0:
-            intent_breakdown[intent] = {"totals": {}, "top_pages": []}
-            continue
-        di = di[di["impressions"].fillna(0) >= float(min_impressions)].copy()
-        di["slug"] = di["slug"].fillna(di["page"].apply(slug_from_url))
-        totals = {
-            "mapped_clicks": safe_int(di["actual_clicks"].fillna(0).sum()),
-            "mapped_impressions": safe_int(di["impressions"].fillna(0).sum()),
-            "opportunity_clicks_est": safe_int(di["opportunity_clicks"].fillna(0).sum()),
-        }
-        di_top = di.sort_values("opportunity_clicks", ascending=False).head(10)
-        top_list = []
-        for _, r in di_top.iterrows():
-            top_list.append(
-                {
-                    "url": str(r.get("page")),
-                    "slug": str(r.get("slug")),
-                    "mapped_impressions": safe_int(r.get("impressions")),
-                    "mapped_clicks": safe_int(r.get("actual_clicks")),
-                    "opportunity_clicks_est": safe_int(r.get("opportunity_clicks")),
-                    "avg_position": safe_float(r.get("avg_position")),
-                    "ctr": safe_float(r.get("ctr")),
-                }
-            )
-        intent_breakdown[intent] = {"totals": totals, "top_pages": top_list}
-
-    brief = {
-        "meta": {
-            "client_name": client_name.strip(),
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "brand_terms": brand_terms,
-            "min_impressions_filter": int(min_impressions),
-            "definitions": {
-                "mapped_clicks/impressions": "Aggregated from query→cluster→page mapping (not necessarily equal to page totals in GSC Pages export).",
-                "opportunity_clicks_est": "Estimated extra clicks based on CTR gap vs expected CTR by position (heuristic baseline).",
-                "intent": "Rule-based classification (brand terms affect navigational).",
-            },
-            "rules_of_use_for_llm": [
-                "Use ONLY the data in this file. Do not invent numbers.",
-                "If something is missing/unclear, list assumptions explicitly.",
-                "Output should be an SEO action plan grounded in the top pages/clusters here.",
-            ],
-        },
-        "kpis": {
-            "mapped_clicks_total": safe_int(total_clicks),
-            "opportunity_clicks_est_total": safe_int(total_opp),
-            "estimated_uplift_pct": round(float(uplift_pct), 2),
-        },
-        "top_pages": top_pages_list,
-        "top_clusters": top_clusters_list,
-        "cannibalisation": cann_list,
-        "intent_breakdown": intent_breakdown,
-    }
-
-    # Markdown companion
-    md_lines = []
-    md_lines.append("# SEO Opportunity Brief (for Custom GPT)")
-    if client_name.strip():
-        md_lines.append(f"**Client:** {client_name.strip()}")
-    md_lines.append(f"**Generated (UTC):** {brief['meta']['generated_at_utc']}")
-    md_lines.append(f"**Brand terms:** {', '.join(brand_terms) if brand_terms else '(none provided)'}")
-    md_lines.append(f"**Min impressions filter:** {min_impressions}")
-    md_lines.append("")
-    md_lines.append("## Headline KPIs (mapped)")
-    md_lines.append(
-        f"- Mapped clicks: **{brief['kpis']['mapped_clicks_total']:,}**\n"
-        f"- Opportunity clicks (est.): **{brief['kpis']['opportunity_clicks_est_total']:,}**\n"
-        f"- Estimated upside: **{brief['kpis']['estimated_uplift_pct']:.2f}%**"
-    )
-    md_lines.append("")
-    md_lines.append("## Top pages (by opportunity clicks)")
-    tp_rows = []
-    for p in brief["top_pages"]:
-        tp_rows.append(
-            [
-                p["slug"],
-                f"{p['mapped_clicks']:,}",
-                f"{p['opportunity_clicks_est']:,}",
-                f"{p['mapped_impressions']:,}",
-                f"{p['avg_position'] if p['avg_position'] is not None else ''}",
-                f"{round(p['ctr']*100,2) if p['ctr'] is not None else ''}%",
-            ]
-        )
-    md_lines.append(
-        md_table(
-            ["page", "clicks", "opp clicks", "impr", "pos", "ctr"],
-            tp_rows,
-            max_col_width=60
-        )
-    )
-    md_lines.append("")
-    md_lines.append("## Top clusters (by opportunity clicks)")
-    tc_rows = []
-    for c in brief["top_clusters"][: min(len(brief["top_clusters"]), 15)]:
-        tc_rows.append(
-            [
-                c["topic_label"],
-                c["dominant_intent"],
-                slug_from_url(c["mapped_page"]),
-                f"{c['opportunity_clicks_est']:,}",
-                c["priority_band"],
-            ]
-        )
-    md_lines.append(
-        md_table(
-            ["topic", "intent", "mapped page", "opp clicks", "band"],
-            tc_rows,
-            max_col_width=50
-        )
-    )
-    md_lines.append("")
-    md_lines.append("## Cannibalisation risks (top)")
-    if brief["cannibalisation"]:
-        cann_rows = []
-        for c in brief["cannibalisation"][:10]:
-            cann_rows.append(
-                [
-                    c["topic_label"],
-                    slug_from_url(c["primary_page"]),
-                    slug_from_url(c["runner_up_page"]),
-                    c["recommended_action"],
-                ]
-            )
-        md_lines.append(md_table(["topic", "primary", "runner-up", "action"], cann_rows, max_col_width=60))
-    else:
-        md_lines.append("_None detected in top set._")
-    md_lines.append("")
-    md_lines.append("## Intent breakdown (totals)")
-    ib_rows = []
-    for intent, d in brief["intent_breakdown"].items():
-        totals = d.get("totals", {}) or {}
-        ib_rows.append(
-            [
-                intent,
-                f"{totals.get('mapped_clicks', 0):,}",
-                f"{totals.get('mapped_impressions', 0):,}",
-                f"{totals.get('opportunity_clicks_est', 0):,}",
-            ]
-        )
-    md_lines.append(md_table(["intent", "clicks", "impr", "opp clicks"], ib_rows))
-    md_lines.append("")
-    md_lines.append("## Instructions for the Custom GPT")
-    md_lines.append(
-        "- Produce: executive summary (3 bullets), top 20 pages with actions, top clusters with actions, cannibalisation fixes, and a 30/60/90-day plan.\n"
-        "- Use only data from this brief. If you make assumptions, list them."
-    )
-
-    return brief, "\n".join(md_lines)
-
-
-# ----------------------------
-# Core pipeline
-# ----------------------------
-@st.cache_data(show_spinner=False)
-def run_pipeline(queries_df: pd.DataFrame, pages_df: pd.DataFrame, compiled_rules):
-    # ---- ingest queries
-    q = queries_df.rename(
-        columns={"Top queries": "query", "Clicks": "clicks", "Impressions": "impressions", "CTR": "ctr_raw", "Position": "position"}
+    q = df.rename(
+        columns={"Top queries": "query", "Clicks": "clicks", "Impressions": "impressions", 
+                 "CTR": "ctr_raw", "Position": "position"}
     ).copy()
 
     q["clicks"] = pd.to_numeric(q["clicks"], errors="coerce").fillna(0).astype(float)
     q["impressions"] = pd.to_numeric(q["impressions"], errors="coerce").fillna(0).astype(float)
     q["ctr"] = q["ctr_raw"].apply(parse_ctr)
-    q.loc[q["ctr"].isna() & (q["impressions"] > 0), "ctr"] = q["clicks"] / q["impressions"]
+    mask_ctr_nan = q["ctr"].isna() & (q["impressions"] > 0)
+    q.loc[mask_ctr_nan, "ctr"] = q.loc[mask_ctr_nan, "clicks"] / q.loc[mask_ctr_nan, "impressions"]
     q["position"] = pd.to_numeric(q["position"], errors="coerce")
-    q["query_norm"] = q["query"].apply(normalize_query)
+    
+    q["query_norm"] = normalize_query_vectorized(q["query"])
 
-    q[["intent", "intent_confidence", "intent_hits"]] = q["query_norm"].apply(
-        lambda s: pd.Series(classify_intent(s, compiled_rules))
-    )
+    # Intent
+    intents = q["query_norm"].apply(lambda s: classify_intent_row(s, compiled_rules))
+    q["intent"] = [x[0] for x in intents]
+    q["intent_confidence"] = [x[1] for x in intents]
+    
+    # Brand Check
+    q["is_branded"] = q["query_norm"].apply(lambda s: check_branded(s, brand_regexes))
+    q["brand_label"] = q["is_branded"].map({True: "Branded", False: "Non-Branded"})
+    
+    # Segment for Stratified Clustering
+    q["segment"] = q["brand_label"] + " - " + q["intent"]
+    
+    return q
 
-    # ---- semantic clustering
-    vec = TfidfVectorizer(ngram_range=(1, 3), min_df=1, max_df=0.95)
-    X = vec.fit_transform(q["query_norm"].tolist())
-    simdist = 1 - cosine_similarity(X)
+def cluster_queries_stratified(q: pd.DataFrame) -> pd.DataFrame:
+    """Clusters queries within each segment independently."""
+    q["cluster_id"] = -1
+    
+    unique_segments = q["segment"].unique()
+    next_start_id = 0
+    
+    for seg in unique_segments:
+        subset = q[q["segment"] == seg].copy()
+        if subset.empty:
+            continue
+            
+        indices = subset.index
+        n_queries = len(subset)
+        
+        vec = TfidfVectorizer(ngram_range=(1, 3), min_df=1, max_df=0.95)
+        try:
+            X = vec.fit_transform(subset["query_norm"].tolist())
+        except ValueError:
+            q.loc[indices, "cluster_id"] = next_start_id
+            next_start_id += 1
+            continue
 
-    cl = AgglomerativeClustering(metric="precomputed", linkage="average", distance_threshold=0.90, n_clusters=None)
-    labels = cl.fit_predict(simdist)
-    q["cluster_id"] = labels
+        if n_queries > CLUSTERING_THRESHOLD_N:
+            n_clusters = max(5, int(n_queries / 10))
+            cl = MiniBatchKMeans(n_clusters=n_clusters, batch_size=1024, random_state=42, n_init="auto")
+            labels = cl.fit_predict(X)
+        elif n_queries < 2:
+            labels = np.zeros(n_queries, dtype=int)
+        else:
+            simdist = 1 - cosine_similarity(X)
+            simdist[simdist < 0] = 0
+            cl = AgglomerativeClustering(metric="precomputed", linkage="average", 
+                                         distance_threshold=0.85, n_clusters=None)
+            labels = cl.fit_predict(simdist)
+            
+        q.loc[indices, "cluster_id"] = labels + next_start_id
+        next_start_id += (labels.max() + 1) if len(labels) > 0 else 1
+        
+    return q
 
-    # ---- topic label via common n-grams
+def label_clusters(q: pd.DataFrame) -> pd.DataFrame:
     def tokens(qn):
         return [t for t in qn.split() if t]
-
     def ngrams(toks, n):
         return [" ".join(toks[i : i + n]) for i in range(len(toks) - n + 1)]
 
     q["tokens"] = q["query_norm"].apply(tokens)
-
-    topic = {}
+    topic_map = {}
+    
     for cid, sub in q.groupby("cluster_id"):
         cand = Counter()
         toks_list = sub["tokens"].tolist()
@@ -605,36 +292,62 @@ def run_pipeline(queries_df: pd.DataFrame, pages_df: pd.DataFrame, compiled_rule
             for n in (3, 2):
                 for g in ngrams(toks, n):
                     cand[g] += 1
-
+        
         best = None
-        for g, cnt in cand.most_common(100):
-            if cnt >= max(2, int(0.3 * len(sub))):
+        threshold = max(2, int(0.3 * len(sub)))
+        for g, cnt in cand.most_common(50):
+            if cnt >= threshold:
                 score = cnt * len(g.split())
                 if best is None or score > best[0]:
                     best = (score, g)
-        topic[cid] = best[1] if best else (toks_list[0][0] if toks_list and toks_list[0] else "misc")
+        
+        if best:
+            topic_map[cid] = best[1]
+        else:
+            fallback = sub["query_norm"].iloc[0] if not sub.empty else "misc"
+            topic_map[cid] = fallback
 
-    q["topic_label"] = q["cluster_id"].map(topic)
+    q["topic_label"] = q["cluster_id"].map(topic_map)
+    return q
 
-    # ---- expected ctr baseline + opportunity clicks + priority
+def calculate_opportunity(q: pd.DataFrame) -> pd.DataFrame:
     q["pos_bucket"] = q["position"].apply(pos_bucket)
     bucket_median = q.groupby("pos_bucket")["ctr"].median().to_dict()
     overall_median = q["ctr"].median()
-
-    q["expected_ctr"] = q["position"].apply(lambda p: expected_ctr_with_floor(p, bucket_median, overall_median))
+    
+    bucket_expectations = {}
+    for b in CTR_FLOOR.keys():
+        med = bucket_median.get(b, overall_median)
+        if pd.isna(med): med = overall_median if not pd.isna(overall_median) else 0.01
+        bucket_expectations[b] = max(med, CTR_FLOOR.get(b, 0.01))
+    
+    q["expected_ctr"] = q["pos_bucket"].map(bucket_expectations).fillna(0.01)
     q["opportunity_clicks"] = (q["impressions"] * np.maximum(0, q["expected_ctr"] - q["ctr"])).fillna(0)
-
+    
     q["priority_score"] = (
         np.log1p(q["clicks"]) * 1.0
         + np.log1p(q["opportunity_clicks"]) * 1.2
         + np.log1p(q["impressions"]) * 0.4
     )
-    q70, q90 = np.quantile(q["priority_score"], [0.70, 0.90])
+    
+    q70, q90 = np.quantile(q["priority_score"], PRIORITY_QUANTILES)
     q["priority_band"] = q["priority_score"].apply(lambda s: "P1" if s >= q90 else ("P2" if s >= q70 else "P3"))
+    return q
 
-    # ---- cluster summary
+def aggregate_clusters(q: pd.DataFrame) -> pd.DataFrame:
+    # 1. Get top queries per cluster
+    top_queries = (
+        q.sort_values(["cluster_id", "impressions"], ascending=[True, False])
+        .groupby("cluster_id")
+        .head(5)
+        .groupby("cluster_id")["query"]
+        .apply(lambda x: " | ".join(x.astype(str)))
+        .reset_index(name="example_queries")
+    )
+
+    # 2. Aggregate metrics
     cluster = (
-        q.groupby(["cluster_id", "topic_label"])
+        q.groupby(["cluster_id", "topic_label", "segment", "brand_label", "intent"])
         .agg(
             queries=("query", "count"),
             clicks=("clicks", "sum"),
@@ -645,29 +358,42 @@ def run_pipeline(queries_df: pd.DataFrame, pages_df: pd.DataFrame, compiled_rule
         )
         .reset_index()
     )
+    
+    # 3. Merge top queries
+    cluster = cluster.merge(top_queries, on="cluster_id", how="left")
+    
+    q70c, q90c = np.quantile(cluster["priority_score"], PRIORITY_QUANTILES)
+    cluster["priority_band"] = cluster["priority_score"].apply(
+        lambda s: "P1" if s >= q90c else ("P2" if s >= q70c else "P3")
+    )
+    
+    cluster["dominant_intent"] = cluster["intent"] 
+    
+    return cluster
 
-    intent_mix = q.pivot_table(index="cluster_id", columns="intent", values="impressions", aggfunc="sum", fill_value=0)
-    dominant_intent = intent_mix.idxmax(axis=1).to_dict()
-    cluster["dominant_intent"] = cluster["cluster_id"].map(dominant_intent)
+def preprocess_pages(df: pd.DataFrame) -> pd.DataFrame:
+    required_cols = ["Top pages", "Clicks", "Impressions", "CTR", "Position"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in Pages CSV: {missing}")
 
-    q70c, q90c = np.quantile(cluster["priority_score"], [0.70, 0.90])
-    cluster["priority_band"] = cluster["priority_score"].apply(lambda s: "P1" if s >= q90c else ("P2" if s >= q70c else "P3"))
-
-    # ---- ingest pages
-    p = pages_df.rename(
-        columns={"Top pages": "page", "Clicks": "page_clicks", "Impressions": "page_impressions", "CTR": "page_ctr_raw", "Position": "page_position"}
+    p = df.rename(
+        columns={"Top pages": "page", "Clicks": "page_clicks", "Impressions": "page_impressions", 
+                 "CTR": "page_ctr_raw", "Position": "page_position"}
     ).copy()
 
     p["page_clicks"] = pd.to_numeric(p["page_clicks"], errors="coerce").fillna(0).astype(float)
     p["page_impressions"] = pd.to_numeric(p["page_impressions"], errors="coerce").fillna(0).astype(float)
     p["page_ctr"] = p["page_ctr_raw"].apply(parse_ctr)
-    p.loc[p["page_ctr"].isna() & (p["page_impressions"] > 0), "page_ctr"] = p["page_clicks"] / p["page_impressions"]
+    mask_ctr_nan = p["page_ctr"].isna() & (p["page_impressions"] > 0)
+    p.loc[mask_ctr_nan, "page_ctr"] = p.loc[mask_ctr_nan, "page_clicks"] / p.loc[mask_ctr_nan, "page_impressions"]
     p["page_position"] = pd.to_numeric(p["page_position"], errors="coerce")
     p["slug"] = p["page"].apply(slug_from_url)
     p["page_tokens"] = p["page"].apply(url_to_tokens)
     p["page_text"] = p["page_tokens"].apply(lambda t: " ".join(t))
+    return p
 
-    # ---- cluster -> page matching (heuristic)
+def map_clusters_to_pages(q: pd.DataFrame, cluster: pd.DataFrame, p: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     rep = (
         q.sort_values(["cluster_id", "impressions"], ascending=[True, False])
         .groupby("cluster_id")
@@ -676,51 +402,57 @@ def run_pipeline(queries_df: pd.DataFrame, pages_df: pd.DataFrame, compiled_rule
         .apply(lambda s: " ".join(s.tolist()))
         .to_dict()
     )
-    cluster["cluster_text"] = (cluster["topic_label"] + " " + cluster["dominant_intent"] + " " + cluster["cluster_id"].map(rep).fillna("")).str.lower()
+    
+    cluster["cluster_text"] = (
+        cluster["topic_label"] + " " + 
+        cluster["dominant_intent"] + " " + 
+        cluster["cluster_id"].map(rep).fillna("")
+    ).str.lower()
 
-    all_text = pd.concat(
-        [
-            cluster[["cluster_id", "cluster_text"]].rename(columns={"cluster_text": "text"}).assign(kind="cluster"),
-            p[["page", "page_text"]].rename(columns={"page_text": "text"}).assign(kind="page"),
-        ],
-        ignore_index=True,
-    )
-
+    cluster_docs = cluster[["cluster_id", "cluster_text"]].rename(columns={"cluster_text": "text"})
+    page_docs = p[["page", "page_text"]].rename(columns={"page_text": "text"})
+    all_text = pd.concat([cluster_docs, page_docs], ignore_index=True)
+    
     v2 = TfidfVectorizer(ngram_range=(1, 3), min_df=1)
     V = v2.fit_transform(all_text["text"].tolist())
-
-    cluster_idx = all_text.index[all_text["kind"] == "cluster"].to_numpy()
-    page_idx = all_text.index[all_text["kind"] == "page"].to_numpy()
-
-    Vc = V[cluster_idx]
-    Vp = V[page_idx]
+    
+    n_clusters = len(cluster)
+    Vc = V[:n_clusters]
+    Vp = V[n_clusters:]
     sim = cosine_similarity(Vc, Vp)
-
-    best = sim.argmax(axis=1)
-    cluster["primary_page"] = [p.iloc[j]["page"] for j in best]
+    
+    best_idx = sim.argmax(axis=1)
+    cluster["primary_page"] = [p.iloc[j]["page"] for j in best_idx]
     cluster["match_score"] = sim.max(axis=1)
+    
+    if sim.shape[1] >= 2:
+        top2_sorted = np.argsort(-sim, axis=1)[:, :2]
+        cluster["runner_up_page"] = [p.iloc[j]["page"] for j in top2_sorted[:, 1]]
+        cluster["runner_up_score"] = np.take_along_axis(sim, top2_sorted, axis=1)[:, 1]
+    else:
+        cluster["runner_up_page"] = None
+        cluster["runner_up_score"] = 0.0
 
-    top2 = np.argsort(-sim, axis=1)[:, :2]
-    cluster["runner_up_page"] = [p.iloc[j]["page"] for j in top2[:, 1]]
-    cluster["runner_up_score"] = np.take_along_axis(sim, top2, axis=1)[:, 1]
-    cluster["cannibalisation_risk"] = (cluster["match_score"] - cluster["runner_up_score"] < 0.03) & (cluster["match_score"] > 0.12)
+    cluster["cannibalisation_risk"] = (
+        (cluster["match_score"] - cluster["runner_up_score"] < 0.03) & 
+        (cluster["match_score"] > 0.12)
+    )
 
     def action(row):
-        if row["cannibalisation_risk"]:
-            return "Fix cannibalisation: pick 1 winner page + align internal links"
-        if row["dominant_intent"] == "transactional" and row["avg_position"] > 10:
-            return "Build/upgrade landing page + strengthen internal links"
-        if row["avg_position"] <= 10:
-            return "CTR/snippet + internal links (quick win)"
-        return "Content refresh + topical authority (hub/spokes)"
+        if row["cannibalisation_risk"]: return "Fix cannibalisation"
+        if row["dominant_intent"] == "transactional" and row["avg_position"] > 10: return "Build/upgrade landing page"
+        if row["avg_position"] <= 10: return "CTR/snippet + internal links"
+        return "Content refresh + topical authority"
 
     cluster["recommended_action"] = cluster.apply(action, axis=1)
-
-    # ---- map each query to its primary page (via cluster)
+    
     cluster_to_page = cluster.set_index("cluster_id")["primary_page"].to_dict()
     q["primary_page"] = q["cluster_id"].map(cluster_to_page)
+    
+    return q, cluster
 
-    # ---- ALL intents: page opportunity (based on mapped clusters)
+def calculate_page_opportunities(q: pd.DataFrame, p: pd.DataFrame, cluster: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    # ALL intents
     page_opportunity_all = (
         cluster.groupby("primary_page")
         .agg(
@@ -733,17 +465,15 @@ def run_pipeline(queries_df: pd.DataFrame, pages_df: pd.DataFrame, compiled_rule
         .reset_index()
         .rename(columns={"primary_page": "page"})
     )
-
     page_opportunity_all = page_opportunity_all.merge(
         p[["page", "slug", "page_impressions", "page_clicks", "page_ctr", "page_position"]],
-        on="page",
-        how="left",
+        on="page", how="left"
     )
     page_opportunity_all["ctr"] = page_opportunity_all["actual_clicks"] / page_opportunity_all["impressions"].replace(0, np.nan)
 
-    # ---- PER INTENT: page opportunity (query-level mapped)
-    page_opportunity_intent = (
-        q.groupby(["primary_page", "intent"])
+    # PER SEGMENT (Brand/Intent)
+    page_opportunity_segment = (
+        q.groupby(["primary_page", "segment", "brand_label", "intent"])
         .agg(
             impressions=("impressions", "sum"),
             actual_clicks=("clicks", "sum"),
@@ -753,233 +483,258 @@ def run_pipeline(queries_df: pd.DataFrame, pages_df: pd.DataFrame, compiled_rule
         .reset_index()
         .rename(columns={"primary_page": "page"})
     )
-    page_opportunity_intent["ctr"] = page_opportunity_intent["actual_clicks"] / page_opportunity_intent["impressions"].replace(0, np.nan)
-
-    page_opportunity_intent = page_opportunity_intent.merge(
+    page_opportunity_segment["ctr"] = page_opportunity_segment["actual_clicks"] / page_opportunity_segment["impressions"].replace(0, np.nan)
+    page_opportunity_segment = page_opportunity_segment.merge(
         p[["page", "slug", "page_clicks", "page_impressions", "page_ctr", "page_position"]],
-        on="page",
-        how="left",
+        on="page", how="left"
     )
-
-    return q, cluster, p, page_opportunity_all, page_opportunity_intent
-
+    
+    return page_opportunity_all, page_opportunity_segment
 
 # ----------------------------
-# UI
+# GPT Brief & Downloads
 # ----------------------------
-st.title("GSC Opportunity Mapper (Exec-friendly)")
+def build_gpt_brief(
+    q_out: pd.DataFrame,
+    cluster_out: pd.DataFrame,
+    page_opps_all: pd.DataFrame,
+    page_opps_segment: pd.DataFrame,
+    brand_terms: list,
+    client_name: str = "",
+    min_impressions: int = 100,
+):
+    top_pages = page_opps_all.sort_values("opportunity_clicks", ascending=False).head(20)
+    top_clusters = cluster_out.sort_values("opportunity_clicks", ascending=False).head(20)
+    
+    brief = {
+        "meta": {
+            "client": client_name,
+            "generated": datetime.now(timezone.utc).isoformat(),
+            "brand_terms": brand_terms
+        },
+        "top_pages": top_pages[["slug", "opportunity_clicks", "avg_position"]].to_dict(orient="records"),
+        "top_clusters": top_clusters[["topic_label", "segment", "opportunity_clicks", "recommended_action", "example_queries"]].to_dict(orient="records")
+    }
+    
+    md = f"# SEO Brief: {client_name}\n\n"
+    md += "## Top Opportunities\n"
+    md += md_table(["Page", "Opp Clicks", "Pos"], [[r["slug"], f"{r['opportunity_clicks']:.0f}", f"{r['avg_position']:.1f}"] for r in brief["top_pages"]])
+    
+    return brief, md
 
-st.sidebar.header("Client settings")
-client_name = st.sidebar.text_input("Client name (optional)", value="")
+def chart_leaderboard_static(df, topn=20):
+    d = df.sort_values("opportunity_clicks", ascending=False).head(topn)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    y = np.arange(len(d))
+    ax.barh(y, d["actual_clicks"], label="Actual")
+    ax.barh(y, d["opportunity_clicks"], left=d["actual_clicks"], label="Opportunity")
+    ax.set_yticks(y)
+    ax.set_yticklabels(d["slug"])
+    ax.invert_yaxis()
+    ax.legend()
+    ax.set_title(f"Top {topn} Pages")
+    plt.tight_layout()
+    return fig
 
-brand_terms_input = st.sidebar.text_input(
-    "Brand terms for navigational intent (comma-separated)",
-    value="",
-    help="Example: acme, acme ltd, acme widgets (leave empty if unknown)",
-)
-brand_terms = [t.strip() for t in brand_terms_input.split(",") if t.strip()]
+# ----------------------------
+# Main App
+# ----------------------------
+def main():
+    st.title("GSC Opportunity Mapper (Stratified)")
+    st.markdown("""
+    **Stratified Logic:** Queries are split into **Branded/Non-Branded**, then by **Intent**, and clustered *within* those segments.
+    
+    This is a free tool provided by [Ruediger Dalchow](https://www.linkedin.com/in/rdalchow/) - if you like it connect with me in LinkedIn.
+    """)
 
-# Keep advanced custom rules optional
-use_custom_rules = st.sidebar.checkbox("Use custom intent regex rules (advanced)", value=False)
-custom_rules = None
-if use_custom_rules:
-    st.sidebar.caption("One regex per line. These REPLACE defaults for that intent.")
-    nav_text = st.sidebar.text_area("Navigational regex", value="")
-    txn_text = st.sidebar.text_area("Transactional regex", value="")
-    com_text = st.sidebar.text_area("Commercial regex", value="")
-    inf_text = st.sidebar.text_area("Informational regex", value="")
+    # --- Sidebar ---
+    st.sidebar.header("Client settings")
+    client_name = st.sidebar.text_input("Client name", value="Client")
+    brand_terms_input = st.sidebar.text_input("Brand terms (comma-separated)", value="")
+    brand_terms = [t.strip() for t in brand_terms_input.split(",") if t.strip()]
 
-    def lines_to_list(s):
-        return [ln.strip() for ln in s.splitlines() if ln.strip()]
+    # --- Upload ---
+    c1, c2 = st.columns(2)
+    q_file = c1.file_uploader("Upload GSC Queries CSV", type=["csv"])
+    p_file = c2.file_uploader("Upload GSC Pages CSV", type=["csv"])
 
-    custom_rules = {}
-    if nav_text.strip():
-        custom_rules["navigational"] = lines_to_list(nav_text)
-    if txn_text.strip():
-        custom_rules["transactional"] = lines_to_list(txn_text)
-    if com_text.strip():
-        custom_rules["commercial"] = lines_to_list(com_text)
-    if inf_text.strip():
-        custom_rules["informational"] = lines_to_list(inf_text)
+    if not (q_file and p_file):
+        st.info("Please upload CSVs.")
+        st.stop()
 
-intent_rules = build_intent_rules(brand_terms=brand_terms, custom_rules=custom_rules)
-compiled_rules = compile_rules(intent_rules)
+    # --- Processing ---
+    try:
+        queries_df = pd.read_csv(q_file)
+        pages_df = pd.read_csv(p_file)
+    except Exception as e:
+        st.error(f"Error reading CSVs: {e}")
+        st.stop()
 
-c1, c2 = st.columns(2)
-with c1:
-    q_file = st.file_uploader("Upload GSC Queries CSV", type=["csv"])
-with c2:
-    p_file = st.file_uploader("Upload GSC Pages CSV", type=["csv"])
+    with st.spinner("Running stratified pipeline..."):
+        intent_rules = build_intent_rules(brand_terms)
+        compiled_rules = compile_rules(intent_rules)
+        brand_regexes = [re.compile(rf"\b{re.escape(t)}\b", re.IGNORECASE) for t in brand_terms]
 
-if not (q_file and p_file):
-    st.info("Upload both CSVs to generate the opportunity map and charts.")
-    st.stop()
+        # Pipeline
+        q_clean = preprocess_queries(queries_df, compiled_rules, brand_regexes)
+        p_clean = preprocess_pages(pages_df)
+        
+        q_clustered = cluster_queries_stratified(q_clean)
+        q_labeled = label_clusters(q_clustered)
+        
+        q_opp = calculate_opportunity(q_labeled)
+        cluster_agg = aggregate_clusters(q_opp)
+        
+        q_final, cluster_final = map_clusters_to_pages(q_opp, cluster_agg, p_clean)
+        page_opps_all, page_opps_segment = calculate_page_opportunities(q_final, p_clean, cluster_final)
+        
+        st.success("Done!")
 
-queries_df = pd.read_csv(q_file)
-pages_df = pd.read_csv(p_file)
+    # --- Results ---
+    tabs = st.tabs(["Visuals", "Tables", "Download"])
 
-with st.spinner("Running clustering + intent + mapping…"):
-    q_out, cluster_out, pages_out, page_opps_all, page_opps_intent = run_pipeline(
-        queries_df, pages_df, compiled_rules
-    )
-
-st.success("Done.")
-
-INTENTS = ["All", "informational", "commercial", "transactional", "navigational"]
-
-t1, t2, t3 = st.tabs(["Executive visuals", "Tables", "Download pack"])
-
-with t1:
-    st.subheader("Executive controls")
-
-    sel_intent = st.selectbox("View by intent", INTENTS, index=0)
-    min_impr = st.number_input("Min impressions (filter)", value=100, step=50, min_value=0)
-
-    topn_bar = st.selectbox("Top N pages (stacked bar)", [15, 20, 25, 50], index=1)
-    topn_scatter = st.selectbox("Top N pages (scatter)", [25, 50, 75, 100], index=1)
-    label_top_scatter = st.selectbox("Scatter labels (top pages)", [0, 5, 10, 15], index=2)
-
-    topn_ctr = st.selectbox("CTR vs Position: plot top N pages by impressions", [100, 200, 300, 500], index=1)
-    label_top_ctr = st.selectbox("CTR vs Position labels (top by opportunity)", [0, 6, 12, 20], index=2)
-
-    if sel_intent == "All":
-        df = page_opps_all.copy()
-        title_suffix = ""
-    else:
-        df = page_opps_intent[page_opps_intent["intent"] == sel_intent].copy()
-        title_suffix = f" ({sel_intent})"
-
-    df = df[df["impressions"].fillna(0) >= float(min_impr)].copy()
-    df["slug"] = df["slug"].fillna(df["page"].apply(slug_from_url))
-    df["ctr"] = df["ctr"].fillna(df.get("page_ctr"))
-    df["avg_position"] = df["avg_position"].fillna(df.get("page_position"))
-
-    # Executive KPIs
-    total_clicks = df["actual_clicks"].fillna(0).sum()
-    total_opp = df["opportunity_clicks"].fillna(0).sum()
-    uplift_pct = (total_opp / total_clicks * 100) if total_clicks > 0 else 0
-
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Actual clicks (mapped)", f"{total_clicks:,.0f}")
-    k2.metric("Opportunity clicks (est.)", f"{total_opp:,.0f}")
-    k3.metric("Estimated upside", f"{uplift_pct:,.1f}%")
-
-    st.pyplot(chart_leaderboard_stacked(df, topn=int(topn_bar), title_suffix=title_suffix, label_col="slug"), clear_figure=True)
-    st.pyplot(chart_scatter_labeled(df, topn=int(topn_scatter), label_top=int(label_top_scatter), title_suffix=title_suffix, label_col="slug"), clear_figure=True)
-    st.pyplot(chart_ctr_vs_position_labeled(df, topn=int(topn_ctr), label_top=int(label_top_ctr), title_suffix=title_suffix, label_col="slug"), clear_figure=True)
-
-    st.subheader("Cannibalisation risks (clusters)")
-    cann = cluster_out[cluster_out["cannibalisation_risk"] == True].sort_values("priority_score", ascending=False)
-    st.dataframe(cann[["topic_label", "dominant_intent", "primary_page", "runner_up_page", "match_score", "runner_up_score", "recommended_action"]])
-
-with t2:
-    st.subheader("Page opportunity (All)")
-    st.dataframe(page_opps_all.sort_values("opportunity_clicks", ascending=False))
-
-    st.subheader("Page opportunity by intent")
-    i1, i2, i3, i4 = st.tabs(["informational", "commercial", "transactional", "navigational"])
-    with i1:
-        st.dataframe(page_opps_intent[page_opps_intent["intent"] == "informational"].sort_values("opportunity_clicks", ascending=False))
-    with i2:
-        st.dataframe(page_opps_intent[page_opps_intent["intent"] == "commercial"].sort_values("opportunity_clicks", ascending=False))
-    with i3:
-        st.dataframe(page_opps_intent[page_opps_intent["intent"] == "transactional"].sort_values("opportunity_clicks", ascending=False))
-    with i4:
-        st.dataframe(page_opps_intent[page_opps_intent["intent"] == "navigational"].sort_values("opportunity_clicks", ascending=False))
-
-    st.subheader("Cluster → page map (sorted by priority)")
-    st.dataframe(cluster_out.sort_values(["priority_band", "priority_score"], ascending=[True, False]))
-
-    st.subheader("Query-level output (top 200 by priority)")
-    st.dataframe(q_out.sort_values(["priority_band", "priority_score"], ascending=[True, False]).head(200))
-
-with t3:
-    st.write("Download a ZIP with outputs + charts + a Custom-GPT briefing pack (`gpt_brief.json` + `gpt_brief.md`).")
-
-    # Defaults for the GPT pack
-    gpt_min_impr = st.number_input("GPT brief: min impressions filter", value=100, step=50, min_value=0)
-    gpt_top_pages = st.selectbox("GPT brief: top pages", [10, 20, 30, 50], index=1)
-    gpt_top_clusters = st.selectbox("GPT brief: top clusters", [10, 20, 30, 50], index=1)
-    gpt_q_per_cluster = st.selectbox("GPT brief: sample queries per cluster", [3, 5, 8, 10], index=1)
-
-    brief_json, brief_md = build_gpt_brief(
-        q_out=q_out,
-        cluster_out=cluster_out,
-        page_opps_all=page_opps_all,
-        page_opps_intent=page_opps_intent,
-        brand_terms=brand_terms,
-        client_name=client_name,
-        min_impressions=int(gpt_min_impr),
-        top_pages=int(gpt_top_pages),
-        top_clusters=int(gpt_top_clusters),
-        queries_per_cluster=int(gpt_q_per_cluster),
-    )
-
-    # Show previews
-    with st.expander("Preview: GPT brief (Markdown)"):
-        st.markdown(brief_md)
-
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
-        # Data outputs
-        z.writestr("gsc_query_clusters_hybrid.csv", q_out.to_csv(index=False))
-        z.writestr("keyword_to_page_map_clusters.csv", cluster_out.to_csv(index=False))
-        z.writestr("gsc_pages_clean.csv", pages_out.to_csv(index=False))
-        z.writestr("page_opportunity_all.csv", page_opps_all.to_csv(index=False))
-        z.writestr("page_opportunity_by_intent.csv", page_opps_intent.to_csv(index=False))
-
-        # GPT pack
-        z.writestr("gpt_brief.json", json.dumps(brief_json, indent=2))
-        z.writestr("gpt_brief.md", brief_md)
-
-        # Charts (All intent default, filtered for readability)
-        df_default = page_opps_all.copy()
-        df_default = df_default[df_default["impressions"].fillna(0) >= 100].copy()
-        df_default["slug"] = df_default["slug"].fillna(df_default["page"].apply(slug_from_url))
-        df_default["ctr"] = df_default["ctr"].fillna(df_default["page_ctr"])
-        df_default["avg_position"] = df_default["avg_position"].fillna(df_default["page_position"])
-
-        charts_to_save = [
-            ("charts/top_pages_actual_vs_opportunity.png", chart_leaderboard_stacked(df_default, topn=20, title_suffix=" (All)")),
-            ("charts/impact_vs_effort_scatter.png", chart_scatter_labeled(df_default, topn=50, label_top=10, title_suffix=" (All)")),
-            ("charts/ctr_vs_position_labeled.png", chart_ctr_vs_position_labeled(df_default, topn=200, label_top=12, title_suffix=" (All)")),
-        ]
-
-        for intent in ["informational", "commercial", "transactional", "navigational"]:
-            dfi = page_opps_intent[page_opps_intent["intent"] == intent].copy()
-            if len(dfi) == 0:
+    with tabs[0]:
+        st.subheader("Top Opportunity Clusters")
+        
+        # Filters
+        f1, f2, f3 = st.columns(3)
+        sel_brand = f1.selectbox("Brand Segment", ["All", "Branded", "Non-Branded"])
+        sel_intent = f2.selectbox("Intent", ["All", "informational", "commercial", "transactional", "navigational"])
+        
+        # Filter Logic (Use cluster_final now)
+        df_viz = cluster_final.copy()
+        
+        if sel_brand != "All":
+            df_viz = df_viz[df_viz["brand_label"] == sel_brand]
+        if sel_intent != "All":
+            df_viz = df_viz[df_viz["intent"] == sel_intent]
+            
+        st.metric("Opportunity Clicks (Filtered)", f"{df_viz['opportunity_clicks'].sum():,.0f}")
+        
+        # Top 15 Clusters for Bubble Chart
+        top_15 = df_viz.sort_values("opportunity_clicks", ascending=False).head(15).copy()
+        
+        # Calculate sizes
+        top_15["total_potential"] = top_15["clicks"] + top_15["opportunity_clicks"]
+        
+        fig = go.Figure()
+        
+        colors = {"P1": "red", "P2": "orange", "P3": "blue"}
+        
+        for band in ["P1", "P2", "P3"]:
+            subset = top_15[top_15["priority_band"] == band]
+            if subset.empty:
                 continue
-            dfi = dfi[dfi["impressions"].fillna(0) >= 100].copy()
-            dfi["slug"] = dfi["slug"].fillna(dfi["page"].apply(slug_from_url))
-            dfi["ctr"] = dfi["ctr"].fillna(dfi["page_ctr"])
-            dfi["avg_position"] = dfi["avg_position"].fillna(dfi["page_position"])
-            charts_to_save.append(
-                (f"charts/top_pages_actual_vs_opportunity_{intent}.png", chart_leaderboard_stacked(dfi, topn=20, title_suffix=f" ({intent})"))
-            )
+                
+            # Outer Bubble (Potential)
+            fig.add_trace(go.Scatter(
+                x=subset["avg_position"],
+                y=subset["opportunity_clicks"],
+                mode='markers',
+                marker=dict(
+                    size=subset["total_potential"],
+                    sizemode='area',
+                    sizeref=2.0 * max(top_15["total_potential"]) / (80**2),
+                    color=colors[band],
+                    opacity=0.3,
+                    line=dict(width=1, color='DarkSlateGrey')
+                ),
+                name=f"{band} (Potential)",
+                legendgroup=band,
+                text=subset["topic_label"],
+                hovertemplate="<b>%{text}</b><br>Potential: %{marker.size:.0f}<br>Opp: %{y:.0f}<extra></extra>"
+            ))
 
-        for name, fig in charts_to_save:
+            # Inner Bubble (Actual)
+            fig.add_trace(go.Scatter(
+                x=subset["avg_position"],
+                y=subset["opportunity_clicks"],
+                mode='markers',
+                marker=dict(
+                    size=subset["clicks"],
+                    sizemode='area',
+                    sizeref=2.0 * max(top_15["total_potential"]) / (80**2),
+                    color=colors[band],
+                    opacity=1.0,
+                    line=dict(width=0)
+                ),
+                name=f"{band} (Actual)",
+                legendgroup=band,
+                showlegend=False,
+                text=subset["topic_label"],
+                hovertemplate="<b>%{text}</b><br>Actual: %{marker.size:.0f}<extra></extra>"
+            ))
+
+        fig.update_layout(
+            title="Top 15 Opportunity Clusters (Inner=Actual, Outer=Potential)",
+            xaxis=dict(title="Average Position", autorange="reversed"),
+            yaxis=dict(title="Opportunity Clicks"),
+            showlegend=True,
+            height=600,
+            legend=dict(title="Priority Band")
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Explanations
+        st.info("""
+        **How to read this chart:**
+        *   **Outer Bubble (Faded)**: Total Potential Clicks (Actual + Opportunity). The larger the outer bubble, the bigger the total pie.
+        *   **Inner Bubble (Solid)**: Actual Clicks. The solid core shows what you are already capturing.
+        *   **The Gap**: The visible faded ring represents the *Opportunity*—clicks you are missing out on.
+        """)
+        
+        with st.expander("ℹ️ How are metrics calculated?"):
+            st.markdown("""
+            **1. Opportunity Clicks**
+            We estimate how many *more* clicks you could get if you improved your CTR to the "expected" level for your position.
+            $$
+            \\text{Opp Clicks} = \\text{Impressions} \\times (\\text{Expected CTR} - \\text{Actual CTR})
+            $$
+            *Expected CTR is based on the median CTR for that position bucket across your dataset (floored at industry baselines).*
+
+            **2. Priority Score**
+            A composite score to rank opportunities, balancing high volume with high potential.
+            $$
+            \\text{Score} = 1.0 \\times \\ln(\\text{Clicks}) + 1.2 \\times \\ln(\\text{Opp Clicks}) + 0.4 \\times \\ln(\\text{Impressions})
+            $$
+
+            **3. Priority Bands**
+            *   🔴 **P1 (High)**: Top 10% of opportunities.
+            *   🟠 **P2 (Medium)**: Next 20%.
+            *   🔵 **P3 (Low)**: Bottom 70%.
+            """)
+
+    with tabs[1]:
+        st.subheader("Detailed Data")
+        st.dataframe(page_opps_segment)
+        st.subheader("Clusters (with Top Queries)")
+        st.dataframe(cluster_final)
+
+    with tabs[2]:
+        st.subheader("Download Pack")
+        
+        brief_json, brief_md = build_gpt_brief(q_final, cluster_final, page_opps_all, page_opps_segment, brand_terms, client_name)
+        
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("gpt_brief.md", brief_md)
+            z.writestr("gpt_brief.json", json.dumps(brief_json, indent=2))
+            z.writestr("clusters.csv", cluster_final.to_csv(index=False))
+            z.writestr("pages_segment.csv", page_opps_segment.to_csv(index=False))
+            
+            # Static chart
             img_buf = io.BytesIO()
-            fig.savefig(img_buf, format="png", bbox_inches="tight", dpi=160)
-            plt.close(fig)
-            z.writestr(name, img_buf.getvalue())
+            fig = chart_leaderboard_static(page_opps_all)
+            fig.savefig(img_buf, format="png")
+            z.writestr("top_pages_chart.png", img_buf.getvalue())
+            
+        st.download_button(
+            "Download ZIP Report",
+            data=zip_buf.getvalue(),
+            file_name="gsc_report.zip",
+            mime="application/zip"
+        )
 
-    st.download_button(
-        "Download report pack (.zip)",
-        data=zip_buf.getvalue(),
-        file_name="gsc_opportunity_report_pack.zip",
-        mime="application/zip",
-    )
-
-    # Optional: standalone downloads for GPT pack
-    st.download_button(
-        "Download gpt_brief.json",
-        data=json.dumps(brief_json, indent=2).encode("utf-8"),
-        file_name="gpt_brief.json",
-        mime="application/json",
-    )
-    st.download_button(
-        "Download gpt_brief.md",
-        data=brief_md.encode("utf-8"),
-        file_name="gpt_brief.md",
-        mime="text/markdown",
-    )
+if __name__ == "__main__":
+    main()
