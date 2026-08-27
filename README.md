@@ -1,11 +1,31 @@
 # GSC Opportunity Mapper
 
-Upload two Google Search Console CSV exports:
-- Queries export
-- Pages export
+A small, API-free SEO helper from [Grumpy Old SEO](https://grumpy-old-seo.com/).
 
-The app clusters queries, maps clusters to pages, estimates CTR opportunity, and generates reporting + a `gpt_brief.json` file for use with a Custom GPT.
+Upload the complete CSV ZIP exported from Google Search Console's Performance
+report. The app automatically detects the available tables and produces:
+
+- page-one CTR opportunities;
+- striking-distance queries;
+- pages and topic clusters worth investigating;
+- a simple date trend when the export contains Dates data;
+- confidence-labelled page suggestions;
+- an optional filtered-export investigation for pages and queries;
+- an optional comparison against an earlier export.
+
+Opportunity-click figures are directional estimates for prioritisation, not
+traffic forecasts. Standard Search Console exports can contain truncated,
+representative data.
 
 ## Run locally
+
+```powershell
 pip install -r requirements.txt
 streamlit run app.py
+```
+
+## Run the tests
+
+```powershell
+python -m unittest discover -s tests -v
+```
