@@ -16,9 +16,9 @@ st.set_page_config(page_title="GSC Opportunity Mapper", page_icon="🔎", layout
 
 def display_columns(frame: pd.DataFrame) -> pd.DataFrame:
     preferred = [
-        "query", "topic_label", "page", "slug", "suggested_page", "intent", "clicks",
+        "query", "topic_label", "page", "slug", "suggested_page", "intent", "business_signal", "clicks",
         "impressions", "ctr", "position", "avg_position", "opportunity_clicks",
-        "match_confidence", "recommended_action", "reason",
+        "business_signal_share", "match_confidence", "recommended_action", "reason",
     ]
     return frame[[column for column in preferred if column in frame.columns]]
 
@@ -30,6 +30,8 @@ def format_table(frame: pd.DataFrame, rows: int = 10) -> pd.DataFrame:
     for column in ("position", "avg_position", "opportunity_clicks"):
         if column in result:
             result[column] = result[column].map(lambda value: round(value, 1) if pd.notna(value) else None)
+    if "business_signal_share" in result:
+        result["business_signal_share"] = result["business_signal_share"].map(lambda value: f"{value:.0%}")
     return result
 
 
@@ -239,14 +241,37 @@ def main() -> None:
         brand_input = right.text_input(
             "Brand terms (optional, comma-separated)", value="", help="Example: Acme, Acme Ltd"
         )
+        with st.expander("Optional: teach the helper your sector's language"):
+            st.caption(
+                "The generic business-signal rules work across industries. Add recurring phrases only if your customers use specialist language."
+            )
+            custom_left, custom_right = st.columns(2)
+            problem_input = custom_left.text_input(
+                "Problems", value="", placeholder="e.g. condensation, chargebacks, stockouts"
+            )
+            objection_input = custom_right.text_input(
+                "Objections", value="", placeholder="e.g. minimum order, lock-in, downtime"
+            )
+            comparison_input = custom_left.text_input(
+                "Comparisons", value="", placeholder="e.g. lease or buy, hosted or on-premise"
+            )
+            outcome_input = custom_right.text_input(
+                "Desired outcomes", value="", placeholder="e.g. faster recovery, lower waste, more bookings"
+            )
         run = st.form_submit_button("Find opportunities", type="primary")
     if not run and "analysis" not in st.session_state:
         return
     if run:
         brand_terms = [term.strip() for term in brand_input.split(",") if term.strip()]
+        custom_business_terms = {
+            "Problem": [term.strip() for term in problem_input.split(",") if term.strip()],
+            "Objection": [term.strip() for term in objection_input.split(",") if term.strip()],
+            "Comparison": [term.strip() for term in comparison_input.split(",") if term.strip()],
+            "Desired outcome": [term.strip() for term in outcome_input.split(",") if term.strip()],
+        }
         try:
             with st.spinner("Reading the export, grouping related searches and finding useful opportunities…"):
-                st.session_state.analysis = analyse_bundle(bundle, brand_terms)
+                st.session_state.analysis = analyse_bundle(bundle, brand_terms, custom_business_terms)
                 st.session_state.client_name = client_name
                 st.session_state.upload_fingerprint = upload_fingerprint
         except (ValueError, MemoryError) as exc:

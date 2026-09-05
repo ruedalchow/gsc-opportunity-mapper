@@ -4,7 +4,7 @@ import zipfile
 
 import pandas as pd
 
-from gsc_analysis import analyse_bundle, parse_ctr, read_gsc_zip
+from gsc_analysis import analyse_bundle, parse_ctr, prepare_queries, read_gsc_zip
 
 
 def make_export(include_dates=True, empty_pages=False):
@@ -61,6 +61,40 @@ class AnalysisTests(unittest.TestCase):
     def test_invalid_zip_has_clear_error(self):
         with self.assertRaisesRegex(ValueError, "not a valid ZIP"):
             read_gsc_zip(b"not a zip")
+
+    def test_business_signals_work_across_industries(self):
+        queries = pd.DataFrame({
+            "query": [
+                "washing machine not working",
+                "are solar panels worth it",
+                "hubspot vs salesforce",
+                "increase restaurant bookings",
+                "blue cotton shirts",
+            ],
+            "clicks": [1, 1, 1, 1, 1],
+            "impressions": [10, 10, 10, 10, 10],
+            "ctr": ["10%"] * 5,
+            "position": [10] * 5,
+        })
+        result = prepare_queries(queries, [])
+        signals = dict(zip(result["query"], result["business_signal"]))
+        self.assertEqual(signals["washing machine not working"], "Problem")
+        self.assertEqual(signals["are solar panels worth it"], "Objection")
+        self.assertEqual(signals["hubspot vs salesforce"], "Comparison")
+        self.assertEqual(signals["increase restaurant bookings"], "Desired outcome")
+        self.assertEqual(signals["blue cotton shirts"], "Other")
+
+    def test_overlapping_and_custom_business_signals_are_retained(self):
+        queries = pd.DataFrame({
+            "query": ["best affordable crm", "prevent stockouts"],
+            "clicks": [1, 1], "impressions": [10, 10], "ctr": ["10%", "10%"], "position": [10, 10],
+        })
+        custom = {"Problem": ["stockouts"]}
+        result = prepare_queries(queries, [], custom).set_index("query")
+        self.assertEqual(result.loc["best affordable crm", "business_signal"], "Comparison")
+        self.assertEqual(result.loc["best affordable crm", "all_business_signals"], "Comparison | Objection")
+        self.assertIn("Problem", result.loc["prevent stockouts", "all_business_signals"])
+        self.assertIn("Desired outcome", result.loc["prevent stockouts", "all_business_signals"])
 
 
 if __name__ == "__main__":

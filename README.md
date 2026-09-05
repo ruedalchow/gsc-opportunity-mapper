@@ -7,6 +7,7 @@ report. The app automatically detects the available tables and produces:
 
 - page-one CTR opportunities;
 - striking-distance queries;
+- cross-industry business signals: problems, objections, comparisons and desired outcomes;
 - pages and topic clusters worth investigating;
 - a simple date trend when the export contains Dates data;
 - confidence-labelled page suggestions;
@@ -16,6 +17,10 @@ report. The app automatically detects the available tables and produces:
 Opportunity-click figures are directional estimates for prioritisation, not
 traffic forecasts. Standard Search Console exports can contain truncated,
 representative data.
+
+Business signals use an industry-neutral rule set. Optional sector-specific
+phrases can be added in the interface without changing or slowing the query
+clustering process. Detailed exports retain overlapping signals and confidence.
 
 ## Run locally
 

@@ -34,6 +34,38 @@ PRIORITY_QUANTILES = (0.70, 0.90)
 DENSE_CLUSTER_LIMIT = 2_000
 PAGE_MATCH_THRESHOLD = 0.08
 
+BUSINESS_SIGNAL_PATTERNS = {
+    "Comparison": [
+        r"\bvs\.?\b", r"\bversus\b", r"\bcompare[ds]?\b", r"\bcomparison\b",
+        r"\bdifference between\b", r"\balternatives?\b", r"\bbetter than\b",
+        r"\bbest\b", r"\btop\b", r"\breviews?\b",
+    ],
+    "Objection": [
+        r"\bworth it\b", r"\btoo expensive\b", r"\bexpensive\b", r"\baffordable\b",
+        r"\b(?:cost|price|pricing|fees?)\b", r"\bsafe\b", r"\breliable\b",
+        r"\btrust(?:ed|worthy)?\b", r"\blegit\b", r"\bscam\b", r"\brisks?\b",
+        r"\bdownsides?\b", r"\bdisadvantages?\b", r"\bcomplaints?\b",
+        r"\bhow long (?:does|will|before)\b", r"\b(?:difficult|hard) to\b",
+    ],
+    "Problem": [
+        r"\bnot working\b", r"\bdoesn['’]?t work\b", r"\bwon['’]?t\b", r"\bcan['’]?t\b",
+        r"\bbroken\b", r"\berrors?\b", r"\bissues?\b", r"\bproblems?\b",
+        r"\bfail(?:ed|ing)?\b", r"\bfailure\b", r"\bdeclin(?:e|ed|ing)\b", r"\bdrop(?:ped|ping)?\b",
+        r"\blost\b", r"\btoo slow\b", r"\bslow\b", r"\bfix(?:ing)?\b",
+        r"\brepair\b", r"\btroubleshoot(?:ing)?\b", r"\bpain\b", r"\bsymptoms?\b",
+        r"\bleak(?:ing)?\b", r"\bnoisy\b", r"\bdamaged?\b",
+    ],
+    "Desired outcome": [
+        r"\bincreas(?:e|ing)\b", r"\bimprov(?:e|ing)\b", r"\bgrow(?:th|ing)?\b",
+        r"\bboost(?:ing)?\b", r"\breduc(?:e|ing)\b", r"\blower(?:ing)?\b",
+        r"\bcut(?:ting)?\b", r"\bsav(?:e|ing)\b", r"\bget more\b",
+        r"\bmore (?:sales|leads|customers|bookings|traffic|revenue)\b",
+        r"\bprevent(?:ing)?\b", r"\bavoid(?:ing)?\b", r"\bfaster\b",
+        r"\blose weight\b", r"\brelief\b", r"\bgenerate (?:sales|leads|revenue)\b",
+        r"\bautomat(?:e|ing|ion)\b", r"\bstreamlin(?:e|ing)\b",
+    ],
+}
+
 
 @dataclass
 class ExportBundle:
@@ -189,6 +221,45 @@ def _classify_intent(query: str, rules: Dict[str, List[re.Pattern]]) -> Tuple[st
     return "informational", 0.40
 
 
+def build_business_signal_rules(
+    custom_terms: Optional[Dict[str, List[str]]] = None,
+) -> Dict[str, List[re.Pattern]]:
+    """Compile generic and optional business-specific signal phrases.
+
+    The rules intentionally describe buyer language rather than any one industry.
+    Custom terms extend the defaults; they never replace them.
+    """
+    compiled: Dict[str, List[re.Pattern]] = {}
+    for signal, patterns in BUSINESS_SIGNAL_PATTERNS.items():
+        extended = list(patterns)
+        for term in (custom_terms or {}).get(signal, []):
+            cleaned = term.strip()
+            if cleaned:
+                extended.append(rf"(?<!\w){re.escape(cleaned)}(?!\w)")
+        compiled[signal] = [re.compile(pattern, re.IGNORECASE) for pattern in extended]
+    return compiled
+
+
+def classify_business_signal(
+    query: str,
+    rules: Dict[str, List[re.Pattern]],
+) -> Tuple[str, str, float]:
+    """Return primary signal, all detected signals and a conservative confidence."""
+    scores = {
+        signal: sum(1 for pattern in patterns if pattern.search(query))
+        for signal, patterns in rules.items()
+    }
+    matched = [signal for signal in BUSINESS_SIGNAL_PATTERNS if scores.get(signal, 0) > 0]
+    if not matched:
+        return "Other", "", 0.20
+
+    # Dict order is the tie-breaker: explicit comparison language is least ambiguous,
+    # followed by objections, problems and outcome language.
+    primary = max(matched, key=lambda signal: scores[signal])
+    confidence = min(0.55 + (0.10 * scores[primary]) + (0.05 if len(matched) == 1 else 0), 0.95)
+    return primary, " | ".join(matched), confidence
+
+
 def position_bucket(position: float) -> str:
     if pd.isna(position):
         return "unknown"
@@ -223,7 +294,11 @@ def _prepare_metrics(df: pd.DataFrame, dimension: str) -> pd.DataFrame:
     return out
 
 
-def prepare_queries(df: pd.DataFrame, brand_terms: List[str]) -> pd.DataFrame:
+def prepare_queries(
+    df: pd.DataFrame,
+    brand_terms: List[str],
+    custom_business_terms: Optional[Dict[str, List[str]]] = None,
+) -> pd.DataFrame:
     queries = _prepare_metrics(df, "query")
     queries["query_norm"] = normalise_query(queries["query"])
     compiled = {
@@ -237,6 +312,11 @@ def prepare_queries(df: pd.DataFrame, brand_terms: List[str]) -> pd.DataFrame:
     queries["is_branded"] = queries["query_norm"].map(lambda q: any(p.search(q) for p in brand_patterns))
     queries["brand_label"] = queries["is_branded"].map({True: "Branded", False: "Non-Branded"})
     queries["segment"] = queries["brand_label"].astype(str) + " - " + queries["intent"].astype(str)
+    business_rules = build_business_signal_rules(custom_business_terms)
+    business_signals = queries["query_norm"].map(lambda q: classify_business_signal(q, business_rules))
+    queries["business_signal"] = [value[0] for value in business_signals]
+    queries["all_business_signals"] = [value[1] for value in business_signals]
+    queries["business_signal_confidence"] = [value[2] for value in business_signals]
     return queries
 
 
@@ -354,6 +434,22 @@ def aggregate_clusters(queries: pd.DataFrame) -> pd.DataFrame:
     positions = pd.DataFrame(position_rows)
     clusters = clusters.merge(positions, on=grouping_columns)
     clusters = clusters.merge(examples, on="cluster_id")
+
+    signal_rows = []
+    for cluster_id, group in queries.groupby("cluster_id"):
+        weights = group.groupby("business_signal")["impressions"].sum()
+        if weights.sum() <= 0:
+            weights = group["business_signal"].value_counts().astype(float)
+        dominant = str(weights.idxmax())
+        total_weight = float(weights.sum())
+        detected = [signal for signal in BUSINESS_SIGNAL_PATTERNS if signal in set(group["business_signal"])]
+        signal_rows.append({
+            "cluster_id": cluster_id,
+            "business_signal": dominant,
+            "business_signal_share": float(weights[dominant] / total_weight) if total_weight else 0.0,
+            "all_business_signals": " | ".join(detected),
+        })
+    clusters = clusters.merge(pd.DataFrame(signal_rows), on="cluster_id", how="left")
     q70, q90 = np.quantile(clusters["priority_score"], PRIORITY_QUANTILES)
     clusters["priority_band"] = np.where(clusters["priority_score"] >= q90, "P1", np.where(clusters["priority_score"] >= q70, "P2", "P3"))
     return clusters
@@ -484,8 +580,14 @@ def compare_query_periods(current: pd.DataFrame, previous: pd.DataFrame) -> pd.D
     return merged.sort_values("clicks_change")
 
 
-def analyse_bundle(bundle: ExportBundle, brand_terms: List[str]) -> Dict[str, Any]:
-    queries = add_opportunity_metrics(prepare_queries(bundle.tables["queries"], brand_terms))
+def analyse_bundle(
+    bundle: ExportBundle,
+    brand_terms: List[str],
+    custom_business_terms: Optional[Dict[str, List[str]]] = None,
+) -> Dict[str, Any]:
+    queries = add_opportunity_metrics(
+        prepare_queries(bundle.tables["queries"], brand_terms, custom_business_terms)
+    )
     pages = prepare_pages(bundle.tables["pages"])
     clustered_queries = cluster_queries(queries)
     clusters = aggregate_clusters(clustered_queries)
